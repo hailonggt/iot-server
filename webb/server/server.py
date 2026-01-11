@@ -114,9 +114,10 @@ def init_firebase():
         firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL})
         return
 
-    key_path = os.path.join(BASE_DIR, "serviceAccountKey.json")
+    key_path = r"D:\keys\serviceAccountKey.json"
     cred = credentials.Certificate(key_path)
     firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL})
+
 
 
 def bootstrap_ai_data(n=400):
