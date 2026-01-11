@@ -29,7 +29,9 @@ from openpyxl.utils import get_column_letter
 """
 
 app = Flask(__name__)
-
+@app.route("/")
+def home():
+    return "IoT Server is running"
 cors_origins = os.getenv("CORS_ORIGINS", "*")
 CORS(app, resources={r"/api/*": {"origins": cors_origins}})
 
