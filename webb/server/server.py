@@ -36,8 +36,13 @@ ADMIN_PASS = os.getenv("ADMIN_PASS", "123456")
 TOKENS = {}
 TOKEN_TTL = 12 * 60 * 60
 
+AI_SAMPLES = []
+MAX_AI_SAMPLES = 2000
+
+
 def now_ts():
     return int(time.time())
+
 
 def init_firebase():
     if firebase_admin._apps:
@@ -51,53 +56,99 @@ def init_firebase():
     cred = credentials.Certificate(cred_dict)
     firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL})
 
+
 @app.before_request
 def before_request():
     init_firebase()
 
+
 def fb_ref(path):
     return db.reference(path)
+
 
 @app.route("/")
 def home():
     return send_from_directory(WEB_DIR, "index.html")
 
+
 @app.route("/<path:path>")
 def static_files(path):
     return send_from_directory(WEB_DIR, path)
+
 
 def compute_online(last_ts, timeout=30):
     if not last_ts:
         return False
     return now_ts() - int(last_ts) <= timeout
 
+
+def mean_std(values):
+    if not values:
+        return 0.0, 1.0
+    mean = sum(values) / len(values)
+    var = sum((v - mean) ** 2 for v in values) / len(values)
+    std = math.sqrt(var) if var > 0 else 1.0
+    return mean, std
+
+
+def ai_evaluate(sample):
+    if len(AI_SAMPLES) < 30:
+        return "AN TOÀN", 1
+
+    smokes = [s["smoke"] for s in AI_SAMPLES]
+    temps = [s["temperature"] for s in AI_SAMPLES]
+    hums = [s["humidity"] for s in AI_SAMPLES]
+
+    mean_s, std_s = mean_std(smokes)
+    mean_t, std_t = mean_std(temps)
+    mean_h, std_h = mean_std(hums)
+
+    z_smoke = (sample["smoke"] - mean_s) / std_s
+    z_temp = (sample["temperature"] - mean_t) / std_t
+    z_hum = (sample["humidity"] - mean_h) / std_h
+
+    if z_smoke >= 3.0 or z_temp >= 3.0:
+        return "NGUY HIỂM", 3
+    if z_smoke >= 1.5 or z_temp >= 1.8 or z_hum >= 2.5:
+        return "CẢNH BÁO", 2
+    return "AN TOÀN", 1
+
+
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "time": now_ts()})
+
 
 @app.post("/api/sensor")
 def post_sensor():
     data = request.get_json() or {}
 
-    payload = {
+    sample = {
         "smoke": int(data.get("smoke", 0)),
         "temperature": float(data.get("temperature", 0)),
         "humidity": float(data.get("humidity", 0)),
-        "timestamp": now_ts(),
-        "status": "AN TOÀN",
-        "level": 1
+        "timestamp": now_ts()
     }
+
+    status, level = ai_evaluate(sample)
+    payload = {**sample, "status": status, "level": level}
+
+    AI_SAMPLES.append(sample)
+    if len(AI_SAMPLES) > MAX_AI_SAMPLES:
+        AI_SAMPLES.pop(0)
 
     fb_ref("sensor/current").set(payload)
     fb_ref("sensor/history").push(payload)
 
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "status": status, "level": level})
+
 
 @app.get("/api/current")
 def get_current():
     cur = fb_ref("sensor/current").get() or {}
     cur["online"] = compute_online(cur.get("timestamp"))
     return jsonify(cur)
+
 
 @app.get("/api/history")
 def get_history():
@@ -110,6 +161,7 @@ def get_history():
 
     items.sort(key=lambda x: x["timestamp"], reverse=True)
     return jsonify({"ok": True, "items": items})
+
 
 @app.post("/api/login")
 def login():
@@ -124,6 +176,7 @@ def login():
     TOKENS[token] = now_ts()
 
     return jsonify({"ok": True, "token": token})
+
 
 def auth_required(fn):
     def wrap(*args, **kwargs):
@@ -140,6 +193,7 @@ def auth_required(fn):
     wrap.__name__ = fn.__name__
     return wrap
 
+
 @app.post("/api/logout")
 @auth_required
 def logout():
@@ -147,6 +201,7 @@ def logout():
     token = auth.split(" ", 1)[1]
     TOKENS.pop(token, None)
     return jsonify({"ok": True})
+
 
 @app.get("/api/admin/export_excel")
 @auth_required
@@ -175,16 +230,19 @@ def export_excel():
         "Content-Disposition": "attachment; filename=iot_history.xlsx"
     }
 
+
 @app.post("/api/admin/delete_history")
 @auth_required
 def delete_history():
     fb_ref("sensor/history").delete()
     return jsonify({"ok": True})
 
+
 @app.post("/api/admin/train_ai")
 @auth_required
 def train_ai():
-    return jsonify({"ok": True, "trained_samples": 0})
+    return jsonify({"ok": True, "trained_samples": len(AI_SAMPLES)})
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
