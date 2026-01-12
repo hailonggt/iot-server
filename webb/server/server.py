@@ -1,249 +1,529 @@
 import os
 import io
-import json
 import time
 import math
-import secrets
+import json
+import pickle
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, render_template, send_file
 from flask_cors import CORS
 
 import firebase_admin
 from firebase_admin import credentials, db
 
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+
+import numpy as np
+from sklearn.ensemble import IsolationForest
 from openpyxl import Workbook
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-WEB_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
 
-app = Flask(
-    __name__,
-    static_folder=WEB_DIR,
-    template_folder=WEB_DIR,
-    static_url_path=""
-)
+# =========================
+# ĐƯỜNG DẪN THEO ĐÚNG CẤU TRÚC REPO CỦA BẠN
+# =========================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))          # webb/server
+WEB_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))        # webb
 
-CORS(app)
+MODEL_PATH = os.path.join(BASE_DIR, "model.pkl")
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "https://baochay-cad24-default-rtdb.asia-southeast1.firebasedatabase.app"
 )
 
-ADMIN_USER = os.getenv("ADMIN_USER", "admin")
-ADMIN_PASS = os.getenv("ADMIN_PASS", "123456")
+FIREBASE_CRED_PATH = os.getenv("FIREBASE_CRED_PATH", os.path.join(BASE_DIR, "serviceAccountKey.json"))
+FIREBASE_CRED_JSON = os.getenv("FIREBASE_CRED_JSON", "")
 
-TOKENS = {}
-TOKEN_TTL = 12 * 60 * 60
+SECRET_KEY = os.getenv("IOT_SECRET_KEY", "change_me_to_a_long_random_secret")
+ADMIN_USER = os.getenv("IOT_ADMIN_USER", "admin")
+ADMIN_PASS = os.getenv("IOT_ADMIN_PASS", "admin123")
+TOKEN_TTL_SECONDS = int(os.getenv("TOKEN_TTL_SECONDS", "3600"))
 
-AI_SAMPLES = []
-MAX_AI_SAMPLES = 2000
+ONLINE_WINDOW_SEC = int(os.getenv("ONLINE_WINDOW_SEC", "20"))
+
+# Ngưỡng cứng
+SMOKE_SAFE_MAX = float(os.getenv("SMOKE_SAFE_MAX", "300"))
+SMOKE_DANGER_MIN = float(os.getenv("SMOKE_DANGER_MIN", "700"))
+TEMP_DANGER_MIN = float(os.getenv("TEMP_DANGER_MIN", "55"))
+
+# AI
+FEATURES = ["smoke", "temperature", "humidity"]
+AI_SCORE_WARN = float(os.getenv("AI_SCORE_WARN", "0.65"))
+
+# Chuỗi trạng thái đúng UI của bạn đang dùng
+STATUS_SAFE = "AN TOÀN"
+STATUS_WARN = "CẢNH BÁO"
+STATUS_DANGER = "NGUY HIỂM"
+
+# Firebase path
+FB_PATH_CURRENT = "current"
+FB_PATH_HISTORY = "history"
+
+# =========================
+# FLASK APP
+# =========================
+app = Flask(
+    __name__,
+    static_folder=WEB_DIR,
+    template_folder=WEB_DIR,
+    static_url_path=""
+)
+CORS(app)
+
+serializer = URLSafeTimedSerializer(SECRET_KEY)
 
 
-def now_ts():
-    return int(time.time())
+# =========================
+# FIREBASE INIT
+# =========================
+FIREBASE_OK = False
+FIREBASE_ERR = ""
 
 
 def init_firebase():
+    global FIREBASE_OK, FIREBASE_ERR
+
     if firebase_admin._apps:
+        FIREBASE_OK = True
         return
 
-    env_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
-    if not env_json:
-        raise RuntimeError("Missing FIREBASE_SERVICE_ACCOUNT_JSON")
+    try:
+        if FIREBASE_CRED_JSON.strip():
+            cred_dict = json.loads(FIREBASE_CRED_JSON)
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL})
+        elif os.path.exists(FIREBASE_CRED_PATH):
+            cred = credentials.Certificate(FIREBASE_CRED_PATH)
+            firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL})
+        else:
+            firebase_admin.initialize_app(options={"databaseURL": DATABASE_URL})
 
-    cred_dict = json.loads(env_json)
-    cred = credentials.Certificate(cred_dict)
-    firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL})
+        FIREBASE_OK = True
+    except Exception as e:
+        FIREBASE_OK = False
+        FIREBASE_ERR = str(e)
 
 
-@app.before_request
-def before_request():
-    init_firebase()
+init_firebase()
 
 
-def fb_ref(path):
+def firebase_required():
+    if not FIREBASE_OK:
+        return jsonify({
+            "ok": False,
+            "error": "Firebase chưa init được",
+            "detail": FIREBASE_ERR,
+            "hint": "Đặt serviceAccountKey.json cạnh server.py hoặc set FIREBASE_CRED_PATH hoặc FIREBASE_CRED_JSON"
+        }), 500
+    return None
+
+
+def fb_ref(path: str):
     return db.reference(path)
 
 
-@app.route("/")
-def home():
-    return send_from_directory(WEB_DIR, "index.html")
+# =========================
+# AUTH TOKEN
+# =========================
+def issue_token(username: str) -> str:
+    return serializer.dumps({"u": username})
 
 
-@app.route("/<path:path>")
-def static_files(path):
-    return send_from_directory(WEB_DIR, path)
-
-
-def compute_online(last_ts, timeout=30):
-    if not last_ts:
+def verify_token(token: str) -> bool:
+    try:
+        serializer.loads(token, max_age=TOKEN_TTL_SECONDS)
+        return True
+    except (BadSignature, SignatureExpired):
         return False
-    return now_ts() - int(last_ts) <= timeout
 
 
-def mean_std(values):
-    if not values:
-        return 0.0, 1.0
-    mean = sum(values) / len(values)
-    var = sum((v - mean) ** 2 for v in values) / len(values)
-    std = math.sqrt(var) if var > 0 else 1.0
-    return mean, std
+def get_bearer_token() -> str:
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return ""
 
 
-def ai_evaluate(sample):
-    if len(AI_SAMPLES) < 30:
-        return "AN TOÀN", 1
-
-    smokes = [s["smoke"] for s in AI_SAMPLES]
-    temps = [s["temperature"] for s in AI_SAMPLES]
-    hums = [s["humidity"] for s in AI_SAMPLES]
-
-    mean_s, std_s = mean_std(smokes)
-    mean_t, std_t = mean_std(temps)
-    mean_h, std_h = mean_std(hums)
-
-    z_smoke = (sample["smoke"] - mean_s) / std_s
-    z_temp = (sample["temperature"] - mean_t) / std_t
-    z_hum = (sample["humidity"] - mean_h) / std_h
-
-    if z_smoke >= 3.0 or z_temp >= 3.0:
-        return "NGUY HIỂM", 3
-    if z_smoke >= 1.5 or z_temp >= 1.8 or z_hum >= 2.5:
-        return "CẢNH BÁO", 2
-    return "AN TOÀN", 1
+def require_admin() -> bool:
+    token = get_bearer_token()
+    return verify_token(token)
 
 
-@app.get("/api/health")
-def health():
-    return jsonify({"ok": True, "time": now_ts()})
+# =========================
+# AI MODEL
+# =========================
+def load_model_payload():
+    if not os.path.exists(MODEL_PATH):
+        return None
+    try:
+        with open(MODEL_PATH, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def save_model_payload(payload):
+    with open(MODEL_PATH, "wb") as f:
+        pickle.dump(payload, f)
+
+
+def train_ai(rows):
+    if not rows or len(rows) < 50:
+        return {"ok": False, "error": "Cần tối thiểu 50 bản ghi để huấn luyện"}
+
+    X = []
+    for r in rows:
+        try:
+            X.append([
+                float(r.get("smoke", 0)),
+                float(r.get("temperature", 0)),
+                float(r.get("humidity", 0)),
+            ])
+        except Exception:
+            pass
+
+    if len(X) < 50:
+        return {"ok": False, "error": "Dữ liệu không đủ sau khi làm sạch"}
+
+    X = np.array(X, dtype=float)
+    mu = X.mean(axis=0)
+    std = X.std(axis=0)
+    std = np.where(std < 1e-6, 1.0, std)
+    Xn = (X - mu) / std
+
+    model = IsolationForest(
+        n_estimators=300,
+        contamination=0.03,
+        random_state=42
+    )
+    model.fit(Xn)
+
+    # Ngưỡng mềm gợi ý từ dữ liệu bình thường
+    preds = model.predict(Xn)
+    normal = X[preds == 1]
+    if normal.shape[0] < 20:
+        normal = X
+
+    suggested = {
+        "smoke_soft": float(np.percentile(normal[:, 0], 97)),
+        "temp_soft": float(np.percentile(normal[:, 1], 97)),
+        "hum_soft": float(np.percentile(normal[:, 2], 97)),
+    }
+
+    save_model_payload({
+        "model": model,
+        "mu": mu,
+        "std": std,
+        "suggested": suggested
+    })
+
+    return {"ok": True, "token": "trained", "suggested": suggested}
+
+
+def ai_predict(smoke, temperature, humidity):
+    payload = load_model_payload()
+    if payload is None:
+        return {"ok": False, "error": "Chưa có AI, hãy bấm Huấn luyện AI"}
+
+    model = payload["model"]
+    mu = payload["mu"]
+    std = payload["std"]
+
+    x = np.array([[float(smoke), float(temperature), float(humidity)]], dtype=float)
+    xn = (x - mu) / std
+
+    pred = int(model.predict(xn)[0])
+    score_raw = float(-model.score_samples(xn)[0])
+    score = float(1.0 - math.exp(-score_raw))
+
+    return {
+        "ok": True,
+        "anomaly": bool(pred == -1),
+        "score": score,
+        "suggested": payload.get("suggested", {})
+    }
+
+
+# =========================
+# LOGIC TRẠNG THÁI KHỚP UI
+# =========================
+def compute_status(smoke, temperature, humidity):
+    # Luật cứng ưu tiên an toàn
+    if (smoke is not None and float(smoke) >= SMOKE_DANGER_MIN) or (temperature is not None and float(temperature) >= TEMP_DANGER_MIN):
+        return STATUS_DANGER
+
+    if smoke is not None and float(smoke) >= SMOKE_SAFE_MAX:
+        return STATUS_WARN
+
+    # AI hỗ trợ cảnh báo sớm nếu có model
+    ai = ai_predict(smoke, temperature, humidity)
+    if ai.get("ok"):
+        if ai.get("anomaly") or float(ai.get("score", 0)) >= AI_SCORE_WARN:
+            return STATUS_WARN
+
+    return STATUS_SAFE
+
+
+# =========================
+# PARSE PAYLOAD ESP32
+# =========================
+def parse_sensor_payload(data: dict):
+    # ESP32 của bạn đang gửi: smoke, temperature, humidity
+    smoke = float(data.get("smoke", 0))
+    temperature = float(data.get("temperature", data.get("temp", 0)))
+    humidity = float(data.get("humidity", data.get("hum", 0)))
+
+    # timestamp server tự tạo theo giây epoch để UI formatTimeFromTs dùng được
+    timestamp = int(time.time())
+
+    return smoke, temperature, humidity, timestamp
+
+
+# =========================
+# FIREBASE READ WRITE
+# =========================
+def write_current(smoke, temperature, humidity, timestamp, status):
+    fb_ref(FB_PATH_CURRENT).set({
+        "smoke": smoke,
+        "temperature": temperature,
+        "humidity": humidity,
+        "timestamp": timestamp,
+        "status": status
+    })
+
+
+def push_history(smoke, temperature, humidity, timestamp, status):
+    fb_ref(FB_PATH_HISTORY).push({
+        "smoke": smoke,
+        "temperature": temperature,
+        "humidity": humidity,
+        "timestamp": timestamp,
+        "status": status
+    })
+
+
+def read_current():
+    return fb_ref(FB_PATH_CURRENT).get() or {}
+
+
+def read_history(limit: int):
+    limit = max(1, min(int(limit), 5000))
+    data = fb_ref(FB_PATH_HISTORY).order_by_key().limit_to_last(limit).get()
+    if not data:
+        return []
+
+    keys = sorted(data.keys())
+    items = []
+    for k in keys:
+        r = data.get(k, {})
+        try:
+            items.append({
+                "smoke": float(r.get("smoke", 0)),
+                "temperature": float(r.get("temperature", 0)),
+                "humidity": float(r.get("humidity", 0)),
+                "timestamp": int(r.get("timestamp", 0)),
+                "status": str(r.get("status", STATUS_SAFE)),
+            })
+        except Exception:
+            pass
+    return items
+
+
+def delete_history():
+    fb_ref(FB_PATH_HISTORY).delete()
+
+
+# =========================
+# ROUTES
+# =========================
+@app.get("/")
+def index():
+    return render_template("index.html")
 
 
 @app.post("/api/sensor")
-def post_sensor():
-    data = request.get_json() or {}
+def api_sensor():
+    chk = firebase_required()
+    if chk:
+        return chk
 
-    sample = {
-        "smoke": int(data.get("smoke", 0)),
-        "temperature": float(data.get("temperature", 0)),
-        "humidity": float(data.get("humidity", 0)),
-        "timestamp": now_ts()
-    }
+    data = request.get_json(silent=True) or {}
+    try:
+        smoke, temperature, humidity, timestamp = parse_sensor_payload(data)
+    except Exception:
+        return jsonify({"ok": False, "error": "Invalid payload"}), 400
 
-    status, level = ai_evaluate(sample)
-    payload = {**sample, "status": status, "level": level}
+    status = compute_status(smoke, temperature, humidity)
 
-    AI_SAMPLES.append(sample)
-    if len(AI_SAMPLES) > MAX_AI_SAMPLES:
-        AI_SAMPLES.pop(0)
+    write_current(smoke, temperature, humidity, timestamp, status)
+    push_history(smoke, temperature, humidity, timestamp, status)
 
-    fb_ref("sensor/current").set(payload)
-    fb_ref("sensor/history").push(payload)
-
-    return jsonify({"ok": True, "status": status, "level": level})
+    return jsonify({"ok": True, "status": status, "timestamp": timestamp})
 
 
 @app.get("/api/current")
-def get_current():
-    cur = fb_ref("sensor/current").get() or {}
-    cur["online"] = compute_online(cur.get("timestamp"))
-    return jsonify(cur)
+def api_current():
+    chk = firebase_required()
+    if chk:
+        return chk
+
+    cur = read_current()
+    now = int(time.time())
+
+    try:
+        ts = int(cur.get("timestamp", 0))
+    except Exception:
+        ts = 0
+
+    online = bool(ts and (now - ts) <= ONLINE_WINDOW_SEC)
+
+    # Nếu chưa có data, vẫn trả đúng key để app.js không văng lỗi
+    if not cur or not ts:
+        return jsonify({
+            "ok": True,
+            "smoke": None,
+            "temperature": None,
+            "humidity": None,
+            "timestamp": 0,
+            "online": False,
+            "status": STATUS_SAFE
+        })
+
+    smoke = float(cur.get("smoke", 0))
+    temperature = float(cur.get("temperature", 0))
+    humidity = float(cur.get("humidity", 0))
+
+    status = str(cur.get("status", ""))
+    if not status:
+        status = compute_status(smoke, temperature, humidity)
+
+    return jsonify({
+        "ok": True,
+        "smoke": smoke,
+        "temperature": temperature,
+        "humidity": humidity,
+        "timestamp": ts,
+        "online": online,
+        "status": status
+    })
 
 
 @app.get("/api/history")
-def get_history():
-    limit = int(request.args.get("limit", 20))
-    snap = fb_ref("sensor/history").order_by_child("timestamp").limit_to_last(limit).get() or {}
+def api_history():
+    chk = firebase_required()
+    if chk:
+        return chk
 
-    items = []
-    for _, val in snap.items():
-        items.append(val)
+    limit = request.args.get("limit", "20")
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 20
 
-    items.sort(key=lambda x: x["timestamp"], reverse=True)
-    return jsonify({"ok": True, "items": items})
+    items = read_history(limit)
+
+    return jsonify({
+        "ok": True,
+        "items": items
+    })
 
 
 @app.post("/api/login")
-def login():
-    data = request.get_json() or {}
-    user = data.get("username", "")
-    pwd = data.get("password", "")
+def api_login():
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username", "")).strip()
+    password = str(data.get("password", "")).strip()
 
-    if user != ADMIN_USER or pwd != ADMIN_PASS:
+    if username != ADMIN_USER or password != ADMIN_PASS:
         return jsonify({"ok": False, "error": "Sai tài khoản hoặc mật khẩu"}), 401
 
-    token = secrets.token_hex(24)
-    TOKENS[token] = now_ts()
-
+    token = issue_token(username)
     return jsonify({"ok": True, "token": token})
 
 
-def auth_required(fn):
-    def wrap(*args, **kwargs):
-        auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "):
-            return jsonify({"ok": False, "error": "Unauthorized"}), 401
-
-        token = auth.split(" ", 1)[1]
-        ts = TOKENS.get(token)
-        if not ts or now_ts() - ts > TOKEN_TTL:
-            return jsonify({"ok": False, "error": "Token expired"}), 401
-
-        return fn(*args, **kwargs)
-    wrap.__name__ = fn.__name__
-    return wrap
-
-
 @app.post("/api/logout")
-@auth_required
-def logout():
-    auth = request.headers.get("Authorization")
-    token = auth.split(" ", 1)[1]
-    TOKENS.pop(token, None)
-    return jsonify({"ok": True})
-
-
-@app.get("/api/admin/export_excel")
-@auth_required
-def export_excel():
-    snap = fb_ref("sensor/history").order_by_child("timestamp").get() or {}
-
-    wb = Workbook()
-    ws = wb.active
-    ws.append(["Time", "Smoke", "Temp", "Humidity", "Status"])
-
-    for _, v in snap.items():
-        ws.append([
-            time.strftime("%H:%M:%S", time.localtime(v["timestamp"])),
-            v["smoke"],
-            v["temperature"],
-            v["humidity"],
-            v["status"]
-        ])
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-
-    return buf.getvalue(), 200, {
-        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "Content-Disposition": "attachment; filename=iot_history.xlsx"
-    }
-
-
-@app.post("/api/admin/delete_history")
-@auth_required
-def delete_history():
-    fb_ref("sensor/history").delete()
+def api_logout():
     return jsonify({"ok": True})
 
 
 @app.post("/api/admin/train_ai")
-@auth_required
-def train_ai():
-    return jsonify({"ok": True, "trained_samples": len(AI_SAMPLES)})
+def api_train_ai():
+    chk = firebase_required()
+    if chk:
+        return chk
+
+    if not require_admin():
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    limit = data.get("limit", 3000)
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 3000
+
+    rows = read_history(limit)
+    res = train_ai(rows)
+    code = 200 if res.get("ok") else 400
+    return jsonify(res), code
+
+
+@app.get("/api/admin/export_excel")
+def api_export_excel():
+    chk = firebase_required()
+    if chk:
+        return chk
+
+    if not require_admin():
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+
+    limit = request.args.get("limit", "500")
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 500
+
+    rows = read_history(limit)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "history"
+
+    ws.append(["timestamp", "smoke", "temperature", "humidity", "status"])
+    for r in rows:
+        ws.append([
+            int(r.get("timestamp", 0)),
+            float(r.get("smoke", 0)),
+            float(r.get("temperature", 0)),
+            float(r.get("humidity", 0)),
+            str(r.get("status", STATUS_SAFE))
+        ])
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+
+    return send_file(
+        bio,
+        as_attachment=True,
+        download_name="iot_history.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+
+@app.post("/api/admin/delete_history")
+def api_delete_history():
+    chk = firebase_required()
+    if chk:
+        return chk
+
+    if not require_admin():
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+
+    delete_history()
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=True)
