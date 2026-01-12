@@ -53,10 +53,7 @@ ONLINE_WINDOW_SEC = 20
 # dưới 400 an toàn
 # 400 đến dưới 700 cảnh báo
 # từ 700 trở lên nguy hiểm
-# AI giữ như cũ, chỉ dùng để cảnh báo nếu phát hiện bất thường
-# ==============================
-SMOKE_SAFE_MAX = 400
-SMOKE_DANGER_MIN = 700
+# AI giữ như cũ, chỉ dùn800
 TEMP_DANGER_MIN = 55
 
 STATUS_SAFE = "AN TOÀN"
