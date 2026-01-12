@@ -3,7 +3,6 @@ import io
 import json
 import time
 import math
-import random
 import secrets
 import functools
 
@@ -14,8 +13,6 @@ import firebase_admin
 from firebase_admin import credentials, db
 
 from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment, PatternFill
-from openpyxl.utils import get_column_letter
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -30,26 +27,21 @@ app = Flask(
 
 CORS(app)
 
-
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "https://baochay-cad24-default-rtdb.asia-southeast1.firebasedatabase.app"
 )
 
-DEVICE_KEY = os.getenv("DEVICE_KEY", "").strip()
-
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "123456")
 
+DEVICE_KEY = os.getenv("DEVICE_KEY", "").strip()
+
 TOKENS = {}
-TOKEN_TTL_SEC = 12 * 60 * 60
-
-AI_SAMPLES = []
-MAX_AI_SAMPLES = 2000
-DEFAULT_VENT = 0.5
+TOKEN_TTL = 12 * 60 * 60
 
 
-def _now_ts():
+def now_ts():
     return int(time.time())
 
 
@@ -67,15 +59,14 @@ def init_firebase():
 
 
 @app.before_request
-def before_any_request():
+def before_any():
     init_firebase()
 
 
-def fb_ref(path):
+def fb(path):
     return db.reference(path)
 
 
-# serve web
 @app.route("/")
 def home():
     return send_from_directory(WEB_DIR, "index.html")
@@ -86,69 +77,15 @@ def static_files(path):
     return send_from_directory(WEB_DIR, path)
 
 
-def compute_online(last_ts, timeout_sec=25):
+def compute_online(last_ts):
     if not last_ts:
         return False
-    return (_now_ts() - int(last_ts)) <= timeout_sec
-
-
-def build_payload_from_request(data):
-    smoke = int(data.get("smoke", 0) or 0)
-    temperature = float(data.get("temperature", 0) or 0)
-    humidity = float(data.get("humidity", 0) or 0)
-
-    ventilation = data.get("ventilation", DEFAULT_VENT)
-    try:
-        ventilation = float(ventilation)
-    except Exception:
-        ventilation = DEFAULT_VENT
-
-    ventilation = max(0.0, min(1.0, ventilation))
-
-    return {
-        "smoke": smoke,
-        "temperature": temperature,
-        "humidity": humidity,
-        "ventilation": ventilation,
-        "timestamp": _now_ts()
-    }
-
-
-def mean_std(values):
-    if not values:
-        return 0.0, 1.0
-    mean = sum(values) / len(values)
-    var = sum((v - mean) ** 2 for v in values) / len(values)
-    std = math.sqrt(var) if var > 0 else 1.0
-    return mean, std
-
-
-def ai_evaluate(sample):
-    if len(AI_SAMPLES) < 30:
-        return "AN TOÀN", 1
-
-    smokes = [s["smoke"] for s in AI_SAMPLES]
-    temps = [s["temperature"] for s in AI_SAMPLES]
-    hums = [s["humidity"] for s in AI_SAMPLES]
-
-    mean_s, std_s = mean_std(smokes)
-    mean_t, std_t = mean_std(temps)
-    mean_h, std_h = mean_std(hums)
-
-    z_smoke = (sample["smoke"] - mean_s) / std_s
-    z_temp = (sample["temperature"] - mean_t) / std_t
-    z_hum = (sample["humidity"] - mean_h) / std_h
-
-    if z_smoke >= 3.0 or z_temp >= 3.0:
-        return "NGUY HIỂM", 3
-    if z_smoke >= 1.5 or z_temp >= 1.8 or z_hum >= 2.5:
-        return "CẢNH BÁO", 2
-    return "AN TOÀN", 1
+    return (now_ts() - int(last_ts)) <= 25
 
 
 @app.get("/api/health")
 def health():
-    return jsonify({"ok": True, "server_time": _now_ts()})
+    return jsonify({"ok": True, "server_time": now_ts()})
 
 
 @app.post("/api/sensor")
@@ -158,42 +95,123 @@ def post_sensor():
         if not got or not secrets.compare_digest(got, DEVICE_KEY):
             return jsonify({"ok": False, "error": "Invalid device key"}), 401
 
-    data = request.get_json(silent=True) or {}
-    sample = build_payload_from_request(data)
+    data = request.get_json() or {}
 
-    status, level = ai_evaluate(sample)
-    payload = {**sample, "status": status, "level": level}
+    payload = {
+        "smoke": int(data.get("smoke", 0)),
+        "temperature": float(data.get("temperature", 0)),
+        "humidity": float(data.get("humidity", 0)),
+        "timestamp": now_ts(),
+    }
 
-    AI_SAMPLES.append(sample)
-    if len(AI_SAMPLES) > MAX_AI_SAMPLES:
-        AI_SAMPLES.pop(0)
+    payload["status"] = "AN TOÀN"
+    payload["level"] = 1
 
-    fb_ref("sensor/current").set(payload)
-    fb_ref("sensor/history").push(payload)
+    fb("sensor/current").set(payload)
+    fb("sensor/history").push(payload)
 
-    return jsonify({"ok": True, "status": status, "level": level})
+    return jsonify({"ok": True})
 
 
 @app.get("/api/current")
-def get_current():
-    cur = fb_ref("sensor/current").get() or {}
-    last_ts = int(cur.get("timestamp", 0) or 0)
-    cur["online"] = compute_online(last_ts)
+def api_current():
+    cur = fb("sensor/current").get() or {}
+    ts = int(cur.get("timestamp", 0) or 0)
+    cur["online"] = compute_online(ts)
     return jsonify(cur)
 
 
 @app.get("/api/history")
-def get_history():
+def api_history():
     limit = int(request.args.get("limit", 20))
-    snap = fb_ref("sensor/history").order_by_child("timestamp").limit_to_last(limit).get() or {}
+    snap = fb("sensor/history").order_by_child("timestamp").limit_to_last(limit).get() or {}
 
     items = []
-    for key, val in snap.items():
-        val["_key"] = key
-        items.append(val)
+    for k, v in snap.items():
+        items.append(v)
 
     items.sort(key=lambda x: x["timestamp"], reverse=True)
     return jsonify({"ok": True, "items": items})
+
+
+@app.post("/api/login")
+def login():
+    data = request.get_json() or {}
+    if data.get("username") != ADMIN_USER or data.get("password") != ADMIN_PASS:
+        return jsonify({"ok": False, "error": "Sai tài khoản hoặc mật khẩu"})
+
+    token = secrets.token_hex(24)
+    TOKENS[token] = now_ts()
+
+    return jsonify({"ok": True, "token": token})
+
+
+def require_auth(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return jsonify({"ok": False, "error": "Unauthorized"}), 401
+
+        token = auth.replace("Bearer ", "")
+        ts = TOKENS.get(token)
+
+        if not ts or now_ts() - ts > TOKEN_TTL:
+            return jsonify({"ok": False, "error": "Token expired"}), 401
+
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+@app.post("/api/logout")
+@require_auth
+def logout():
+    auth = request.headers.get("Authorization", "")
+    token = auth.replace("Bearer ", "")
+    TOKENS.pop(token, None)
+    return jsonify({"ok": True})
+
+
+@app.get("/api/admin/export_excel")
+@require_auth
+def export_excel():
+    snap = fb("sensor/history").order_by_child("timestamp").get() or {}
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Time", "Smoke", "Temp", "Hum", "Status"])
+
+    for k, v in snap.items():
+        ws.append([
+            time.strftime("%H:%M:%S", time.localtime(v["timestamp"])),
+            v.get("smoke", 0),
+            v.get("temperature", 0),
+            v.get("humidity", 0),
+            v.get("status", "")
+        ])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    return send_from_directory(
+        directory=".",
+        path="iot.xlsx",
+        as_attachment=True
+    )
+
+
+@app.post("/api/admin/delete_history")
+@require_auth
+def delete_history():
+    fb("sensor/history").delete()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/admin/train_ai")
+@require_auth
+def train_ai():
+    return jsonify({"ok": True, "trained_samples": 0})
 
 
 if __name__ == "__main__":
