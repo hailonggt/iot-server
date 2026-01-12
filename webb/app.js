@@ -63,7 +63,9 @@ function initChart() {
 function updateChart(items) {
   if (!state.chart) return;
 
+  // giữ nguyên thứ tự thời gian từ cũ -> mới
   const asc = [...items];
+
   state.chart.data.labels = asc.map((x) => formatTimeFromTs(x.timestamp));
   state.chart.data.datasets[0].data = asc.map((x) => Number(x.smoke || 0));
   state.chart.data.datasets[1].data = asc.map((x) => Number(x.temperature || 0));
@@ -91,10 +93,13 @@ async function fetchHistory() {
   const js = await res.json();
   if (!js.ok) return;
 
+  // bảng hiển thị mới nhất lên trên
+  const items = [...js.items].reverse();
+
   const tbody = $("historyBody");
   tbody.innerHTML = "";
 
-  for (const it of js.items) {
+  for (const it of items) {
     const tr = document.createElement("tr");
 
     const st = it.status || "...";
@@ -119,6 +124,7 @@ async function fetchHistory() {
     tbody.appendChild(tr);
   }
 
+  // chart dùng thứ tự gốc từ cũ -> mới
   updateChart(js.items);
 }
 
@@ -178,7 +184,6 @@ async function doTrainAI() {
   const res = await fetch(`${API_BASE}/api/admin/train_ai`, {
     method: "POST",
     headers: authHeaders(),
-    body: JSON.stringify({ limit: 3000 }),
   });
 
   const js = await res.json();
@@ -192,7 +197,7 @@ async function doTrainAI() {
 async function doExportExcel() {
   if (!state.token) return;
 
-  const res = await fetch(`${API_BASE}/api/admin/export_excel?limit=2000`, {
+  const res = await fetch(`${API_BASE}/api/admin/export_excel`, {
     headers: authHeaders(),
   });
 
