@@ -9,6 +9,8 @@ const state = {
   chart: null,
 };
 
+const ONLINE_WINDOW_SEC = 20;
+
 function formatNumber(v, digits = 1) {
   if (v === null || v === undefined || Number.isNaN(v)) return "...";
   const n = Number(v);
@@ -33,8 +35,23 @@ function setBadge(el, text) {
 
 function authHeaders() {
   const h = { "Content-Type": "application/json" };
-  if (state.token) h.Authorization = `Bearer ${state.token}`;
+
+  if (state.token) {
+    h.Authorization = `Bearer ${state.token}`;
+    h["X-Auth-Token"] = state.token;
+  }
   return h;
+}
+
+function handle401(res) {
+  if (res && res.status === 401) {
+    state.token = "";
+    localStorage.removeItem("iot_token");
+    refreshAuthUI();
+    alert("Token hết hạn hoặc sai, đăng nhập lại");
+    return true;
+  }
+  return false;
 }
 
 function initChart() {
@@ -60,32 +77,31 @@ function initChart() {
   });
 }
 
-function updateChart(items) {
+function updateChart(itemsAsc) {
   if (!state.chart) return;
 
-  // giữ nguyên thứ tự thời gian từ cũ -> mới
-  const asc = [...items];
-
-  state.chart.data.labels = asc.map((x) => formatTimeFromTs(x.timestamp));
-  state.chart.data.datasets[0].data = asc.map((x) => Number(x.smoke || 0));
-  state.chart.data.datasets[1].data = asc.map((x) => Number(x.temperature || 0));
-  state.chart.data.datasets[2].data = asc.map((x) => Number(x.humidity || 0));
+  state.chart.data.labels = itemsAsc.map((x) => formatTimeFromTs(x.timestamp));
+  state.chart.data.datasets[0].data = itemsAsc.map((x) => Number(x.smoke || 0));
+  state.chart.data.datasets[1].data = itemsAsc.map((x) => Number(x.temperature || 0));
+  state.chart.data.datasets[2].data = itemsAsc.map((x) => Number(x.humidity || 0));
 
   state.chart.update();
 }
 
-async function fetchCurrent() {
-  const res = await fetch(`${API_BASE}/api/current`);
-  const cur = await res.json();
+function updateTopFromLatest(latest) {
+  if (!latest) return;
 
-  $("tempValue").textContent = formatNumber(cur.temperature, 1);
-  $("humValue").textContent = formatNumber(cur.humidity, 0);
-  $("smokeValue").textContent = formatNumber(cur.smoke, 0);
+  $("tempValue").textContent = formatNumber(latest.temperature, 1);
+  $("humValue").textContent = formatNumber(latest.humidity, 0);
+  $("smokeValue").textContent = formatNumber(latest.smoke, 0);
 
-  $("lastUpdateText").textContent = formatTimeFromTs(cur.timestamp);
-  $("onlineText").textContent = cur.online ? "Online" : "Offline";
+  $("lastUpdateText").textContent = formatTimeFromTs(latest.timestamp);
 
-  setBadge($("aiBadge"), cur.status || "...");
+  const nowSec = Math.floor(Date.now() / 1000);
+  const online = latest.timestamp && (nowSec - Number(latest.timestamp)) <= ONLINE_WINDOW_SEC;
+  $("onlineText").textContent = online ? "Online" : "Offline";
+
+  setBadge($("aiBadge"), latest.status || "...");
 }
 
 async function fetchHistory() {
@@ -93,13 +109,18 @@ async function fetchHistory() {
   const js = await res.json();
   if (!js.ok) return;
 
-  // bảng hiển thị mới nhất lên trên
-  const items = [...js.items].reverse();
+  const itemsAsc = js.items || [];
+  const latest = itemsAsc.length ? itemsAsc[itemsAsc.length - 1] : null;
+
+  updateTopFromLatest(latest);
 
   const tbody = $("historyBody");
   tbody.innerHTML = "";
 
-  for (const it of items) {
+  // Table: mới nhất lên trên
+  const itemsDesc = [...itemsAsc].reverse();
+
+  for (const it of itemsDesc) {
     const tr = document.createElement("tr");
 
     const st = it.status || "...";
@@ -124,8 +145,8 @@ async function fetchHistory() {
     tbody.appendChild(tr);
   }
 
-  // chart dùng thứ tự gốc từ cũ -> mới
-  updateChart(js.items);
+  // Chart: timeline tăng dần trái sang phải
+  updateChart(itemsAsc);
 }
 
 function showLoginModal(show) {
@@ -184,7 +205,10 @@ async function doTrainAI() {
   const res = await fetch(`${API_BASE}/api/admin/train_ai`, {
     method: "POST",
     headers: authHeaders(),
+    body: JSON.stringify({ limit: 3000 }),
   });
+
+  if (handle401(res)) return;
 
   const js = await res.json();
   if (!js.ok) {
@@ -197,9 +221,11 @@ async function doTrainAI() {
 async function doExportExcel() {
   if (!state.token) return;
 
-  const res = await fetch(`${API_BASE}/api/admin/export_excel`, {
-    headers: authHeaders(),
-  });
+  // Nhét token vào query để chắc chắn không bị mất header lúc download file
+  const url = `${API_BASE}/api/admin/export_excel?limit=2000&token=${encodeURIComponent(state.token)}`;
+  const res = await fetch(url);
+
+  if (handle401(res)) return;
 
   if (!res.ok) {
     alert("Xuất Excel thất bại");
@@ -224,6 +250,8 @@ async function doDeleteAll() {
     headers: authHeaders(),
   });
 
+  if (handle401(res)) return;
+
   const js = await res.json();
   if (!js.ok) {
     alert(js.error || "Xóa thất bại");
@@ -247,7 +275,6 @@ function bindEvents() {
 
 async function tick() {
   try {
-    await fetchCurrent();
     await fetchHistory();
   } catch (e) {
     console.log("fetch error", e);
