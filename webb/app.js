@@ -1,84 +1,183 @@
-import os
-import json
-import time
-import random
+const $ = (id) => document.getElementById(id);
 
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
+const API_BASE = (window.IOT_API_BASE && window.IOT_API_BASE.trim())
+  ? window.IOT_API_BASE.trim()
+  : `${location.protocol}//${location.host}`;
 
-import firebase_admin
-from firebase_admin import credentials, db
+const state = {
+  token: localStorage.getItem("iot_token") || "",
+  chart: null,
+};
 
-app = Flask(__name__, static_folder="../web", static_url_path="")
-CORS(app)
+function formatNumber(v, digits = 1) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "--";
+  const n = Number(v);
+  if (Number.isNaN(n)) return "--";
+  return digits === 0 ? String(Math.round(n)) : n.toFixed(digits);
+}
 
-DATABASE_URL = "https://baochay-cad24-default-rtdb.asia-southeast1.firebasedatabase.app"
+function formatTimeFromTs(ts) {
+  if (!ts) return "--:--:--";
+  const d = new Date(Number(ts) * 1000);
+  return d.toLocaleTimeString("vi-VN", { hour12: false });
+}
 
-def init_firebase():
-    if firebase_admin._apps:
-        return
+function setBadge(el, text) {
+  el.textContent = text || "--";
+  el.classList.remove("badge-safe", "badge-warn", "badge-danger");
 
-    key_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
-    if not key_json:
-        raise RuntimeError("Missing FIREBASE_SERVICE_ACCOUNT_JSON")
+  if (text === "AN TOÀN") el.classList.add("badge-safe");
+  else if (text === "CẢNH BÁO") el.classList.add("badge-warn");
+  else if (text === "NGUY HIỂM") el.classList.add("badge-danger");
+}
 
-    cred = credentials.Certificate(json.loads(key_json))
-    firebase_admin.initialize_app(cred, {
-        "databaseURL": DATABASE_URL
-    })
+function authHeaders() {
+  const h = { "Content-Type": "application/json" };
+  if (state.token) h.Authorization = `Bearer ${state.token}`;
+  return h;
+}
 
-init_firebase()
+function initChart() {
+  const canvas = $("historyChart");
+  if (!canvas) return;
 
-def now_ts():
-    return int(time.time())
+  const ctx = canvas.getContext("2d");
 
-def fb_ref(path):
-    return db.reference(path)
+  state.chart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: [],
+      datasets: [
+        { label: "Khói MQ2", data: [], tension: 0.35, borderWidth: 3 },
+        { label: "Nhiệt độ °C", data: [], tension: 0.35, borderWidth: 3 },
+        { label: "Độ ẩm %", data: [], tension: 0.35, borderWidth: 3 },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+    },
+  });
+}
 
-@app.route("/")
-def home():
-    return send_from_directory(app.static_folder, "index.html")
+function updateChart(items) {
+  if (!state.chart) return;
 
-@app.route("/<path:path>")
-def static_proxy(path):
-    return send_from_directory(app.static_folder, path)
+  const asc = [...items].reverse();
 
-@app.get("/api/health")
-def health():
-    return jsonify({"ok": True, "time": now_ts()})
+  state.chart.data.labels = asc.map((x) => formatTimeFromTs(x.timestamp));
+  state.chart.data.datasets[0].data = asc.map((x) => Number(x.smoke || 0));
+  state.chart.data.datasets[1].data = asc.map((x) => Number(x.temperature || 0));
+  state.chart.data.datasets[2].data = asc.map((x) => Number(x.humidity || 0));
 
-@app.post("/api/sensor")
-def post_sensor():
-    data = request.get_json(silent=True) or {}
+  state.chart.update();
+}
 
-    payload = {
-        "smoke": int(data.get("smoke", 0)),
-        "temperature": float(data.get("temperature", 0)),
-        "humidity": float(data.get("humidity", 0)),
-        "timestamp": now_ts()
-    }
+async function fetchCurrent() {
+  const res = await fetch(`${API_BASE}/api/current`);
+  const cur = await res.json();
 
-    fb_ref("sensor/current").set(payload)
-    fb_ref("sensor/history").push(payload)
+  $("tempValue").textContent = formatNumber(cur.temperature, 1);
+  $("humValue").textContent = formatNumber(cur.humidity, 0);
+  $("smokeValue").textContent = formatNumber(cur.smoke, 0);
+  $("lastUpdateText").textContent = formatTimeFromTs(cur.timestamp);
+  $("onlineText").textContent = cur.online ? "Online" : "Offline";
 
-    return jsonify({"ok": True})
+  setBadge($("aiBadge"), cur.status || "--");
+}
 
-@app.get("/api/current")
-def get_current():
-    cur = fb_ref("sensor/current").get() or {}
-    return jsonify(cur)
+async function fetchHistory() {
+  const res = await fetch(`${API_BASE}/api/history?limit=20`);
+  const js = await res.json();
+  if (!js.ok) return;
 
-@app.get("/api/history")
-def get_history():
-    snap = fb_ref("sensor/history").order_by_child("timestamp").limit_to_last(20).get() or {}
+  const tbody = $("historyBody");
+  tbody.innerHTML = "";
 
-    items = []
-    for _, val in snap.items():
-        items.append(val)
+  for (const it of js.items) {
+    const tr = document.createElement("tr");
 
-    items.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
-    return jsonify({"ok": True, "items": items})
+    tr.innerHTML = `
+      <td>${formatTimeFromTs(it.timestamp)}</td>
+      <td>${formatNumber(it.smoke, 0)}</td>
+      <td>${formatNumber(it.temperature, 1)}</td>
+      <td>${formatNumber(it.humidity, 0)}</td>
+      <td><span class="badge">${it.status}</span></td>
+    `;
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    tbody.appendChild(tr);
+  }
+
+  updateChart(js.items);
+}
+
+function showLoginModal(show) {
+  $("loginModal").classList.toggle("hidden", !show);
+  $("loginHint").textContent = "";
+}
+
+function refreshAuthUI() {
+  $("btnLoginOpen").classList.toggle("hidden", !!state.token);
+  $("btnLogout").classList.toggle("hidden", !state.token);
+}
+
+async function doLogin() {
+  const username = $("loginUser").value.trim();
+  const password = $("loginPass").value.trim();
+
+  const res = await fetch(`${API_BASE}/api/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+
+  const js = await res.json();
+
+  if (!js.ok) {
+    $("loginHint").textContent = js.error || "Đăng nhập thất bại";
+    return;
+  }
+
+  state.token = js.token;
+  localStorage.setItem("iot_token", state.token);
+
+  showLoginModal(false);
+  refreshAuthUI();
+}
+
+async function doLogout() {
+  await fetch(`${API_BASE}/api/logout`, {
+    method: "POST",
+    headers: authHeaders(),
+  }).catch(() => {});
+
+  state.token = "";
+  localStorage.removeItem("iot_token");
+  refreshAuthUI();
+}
+
+function bindEvents() {
+  $("btnLoginOpen").addEventListener("click", () => showLoginModal(true));
+  $("btnLoginClose").addEventListener("click", () => showLoginModal(false));
+  $("btnLogin").addEventListener("click", doLogin);
+  $("btnLogout").addEventListener("click", doLogout);
+}
+
+async function tick() {
+  try {
+    await fetchCurrent();
+    await fetchHistory();
+  } catch (e) {
+    console.log("fetch error", e);
+  }
+}
+
+function start() {
+  initChart();
+  bindEvents();
+  refreshAuthUI();
+  tick();
+  setInterval(tick, 5000);
+}
+
+window.addEventListener("DOMContentLoaded", start);
