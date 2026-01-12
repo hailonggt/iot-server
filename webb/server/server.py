@@ -2,7 +2,6 @@ import os
 import io
 import time
 import json
-import math
 import pickle
 
 from flask import Flask, request, jsonify, send_file
@@ -30,8 +29,8 @@ DATABASE_URL = os.getenv(
     "https://baochay-cad24-default-rtdb.asia-southeast1.firebasedatabase.app"
 )
 
-FIREBASE_CRED_PATH = os.getenv("FIREBASE_CRED_PATH", os.path.join(BASE_DIR, "serviceAccountKey.json"))
-FIREBASE_CRED_JSON = os.getenv("FIREBASE_CRED_JSON", "")
+# DÙNG ĐÚNG BIẾN BẠN ĐẶT TRÊN RENDER
+FIREBASE_CRED_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "")
 
 SECRET_KEY = os.getenv("IOT_SECRET_KEY", "iot_secret_key_change_me")
 ADMIN_USER = os.getenv("IOT_ADMIN_USER", "admin")
@@ -71,24 +70,28 @@ FIREBASE_ERR = ""
 
 def init_firebase():
     global FIREBASE_OK, FIREBASE_ERR
+
     if firebase_admin._apps:
         return
 
     try:
-        if FIREBASE_CRED_JSON.strip():
-            cred_dict = json.loads(FIREBASE_CRED_JSON)
-            cred = credentials.Certificate(cred_dict)
-            firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL})
-        elif os.path.exists(FIREBASE_CRED_PATH):
-            cred = credentials.Certificate(FIREBASE_CRED_PATH)
-            firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL})
-        else:
-            firebase_admin.initialize_app(options={"databaseURL": DATABASE_URL})
+        if not FIREBASE_CRED_JSON:
+            raise Exception("Missing FIREBASE_SERVICE_ACCOUNT_JSON")
+
+        cred_dict = json.loads(FIREBASE_CRED_JSON)
+        cred = credentials.Certificate(cred_dict)
+
+        firebase_admin.initialize_app(cred, {
+            "databaseURL": DATABASE_URL
+        })
 
         FIREBASE_OK = True
+        print("Firebase init OK")
+
     except Exception as e:
         FIREBASE_OK = False
         FIREBASE_ERR = str(e)
+        print("Firebase init FAILED:", FIREBASE_ERR)
 
 
 init_firebase()
