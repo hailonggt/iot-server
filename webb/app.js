@@ -63,8 +63,7 @@ function initChart() {
 function updateChart(items) {
   if (!state.chart) return;
 
-  const asc = [...items].reverse();
-
+  const asc = [...items];
   state.chart.data.labels = asc.map((x) => formatTimeFromTs(x.timestamp));
   state.chart.data.datasets[0].data = asc.map((x) => Number(x.smoke || 0));
   state.chart.data.datasets[1].data = asc.map((x) => Number(x.temperature || 0));
