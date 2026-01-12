@@ -5,10 +5,9 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>HỆ THỐNG GIÁM SÁT IoT</title>
 
-  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="/style.css" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-
-  <script src="config.js"></script>
+  <script src="/config.js"></script>
 </head>
 
 <body>
@@ -21,7 +20,7 @@
     <div class="topbar-right">
       <div class="topbar-meta">
         <div class="meta-label">Cập nhật lúc</div>
-        <div class="meta-value" id="lastUpdateText">--:--:--</div>
+        <div class="meta-value" id="lastUpdateText">00:00:00</div>
       </div>
 
       <div class="topbar-actions">
@@ -44,7 +43,7 @@
           </div>
         </div>
         <div class="metric-value">
-          <span id="tempValue">--</span>
+          <span id="tempValue">...</span>
           <span class="metric-unit">°C</span>
         </div>
       </div>
@@ -60,7 +59,7 @@
           </div>
         </div>
         <div class="metric-value">
-          <span id="humValue">--</span>
+          <span id="humValue">...</span>
           <span class="metric-unit">%</span>
         </div>
       </div>
@@ -77,7 +76,7 @@
           </div>
         </div>
         <div class="metric-value">
-          <span id="smokeValue">--</span>
+          <span id="smokeValue">...</span>
           <span class="metric-unit">ppm</span>
         </div>
       </div>
@@ -96,21 +95,21 @@
         <div class="status-grid">
           <div class="status-item">
             <div class="status-k">ESP32</div>
-            <div class="status-v" id="onlineText">--</div>
+            <div class="status-v" id="onlineText">...</div>
           </div>
 
           <div class="status-item">
             <div class="status-k">Đánh giá AI</div>
             <div class="status-v">
-              <span class="badge" id="aiBadge">--</span>
+              <span class="badge" id="aiBadge">...</span>
             </div>
           </div>
         </div>
 
         <div class="admin-row">
-          <button class="btn btn-primary" id="btnTrainAI" title="Huấn luyện AI lại từ lịch sử">Huấn luyện AI</button>
-          <button class="btn btn-secondary" id="btnExportExcel" title="Xuất Excel lịch sử">Xuất Excel</button>
-          <button class="btn btn-danger" id="btnDeleteAll" title="Xóa toàn bộ lịch sử">Xóa dữ liệu</button>
+          <button class="btn btn-primary" id="btnTrainAI">Huấn luyện AI</button>
+          <button class="btn btn-secondary" id="btnExportExcel">Xuất Excel</button>
+          <button class="btn btn-danger" id="btnDeleteAll">Xóa dữ liệu</button>
         </div>
       </div>
     </section>
@@ -168,6 +167,6 @@
     </div>
   </div>
 
-  <script src="app.js"></script>
+  <script src="/app.js"></script>
 </body>
 </html>
