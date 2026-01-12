@@ -9,8 +9,6 @@ const state = {
   chart: null,
 };
 
-const ONLINE_WINDOW_SEC = 20;
-
 function formatNumber(v, digits = 1) {
   if (v === null || v === undefined || Number.isNaN(v)) return "...";
   const n = Number(v);
@@ -35,23 +33,12 @@ function setBadge(el, text) {
 
 function authHeaders() {
   const h = { "Content-Type": "application/json" };
-
-  if (state.token) {
-    h.Authorization = `Bearer ${state.token}`;
-    h["X-Auth-Token"] = state.token;
-  }
+  if (state.token) h.Authorization = `Bearer ${state.token}`;
   return h;
 }
 
-function handle401(res) {
-  if (res && res.status === 401) {
-    state.token = "";
-    localStorage.removeItem("iot_token");
-    refreshAuthUI();
-    alert("Token hết hạn hoặc sai, đăng nhập lại");
-    return true;
-  }
-  return false;
+function sortByTsAsc(items) {
+  return [...items].sort((a, b) => (Number(a.timestamp) || 0) - (Number(b.timestamp) || 0));
 }
 
 function initChart() {
@@ -73,6 +60,7 @@ function initChart() {
     options: {
       responsive: true,
       maintainAspectRatio: true,
+      animation: false,
     },
   });
 }
@@ -88,20 +76,18 @@ function updateChart(itemsAsc) {
   state.chart.update();
 }
 
-function updateTopFromLatest(latest) {
-  if (!latest) return;
+async function fetchCurrent() {
+  const res = await fetch(`${API_BASE}/api/current`);
+  const cur = await res.json();
 
-  $("tempValue").textContent = formatNumber(latest.temperature, 1);
-  $("humValue").textContent = formatNumber(latest.humidity, 0);
-  $("smokeValue").textContent = formatNumber(latest.smoke, 0);
+  $("tempValue").textContent = formatNumber(cur.temperature, 1);
+  $("humValue").textContent = formatNumber(cur.humidity, 0);
+  $("smokeValue").textContent = formatNumber(cur.smoke, 0);
 
-  $("lastUpdateText").textContent = formatTimeFromTs(latest.timestamp);
+  $("lastUpdateText").textContent = formatTimeFromTs(cur.timestamp);
+  $("onlineText").textContent = cur.online ? "Online" : "Offline";
 
-  const nowSec = Math.floor(Date.now() / 1000);
-  const online = latest.timestamp && (nowSec - Number(latest.timestamp)) <= ONLINE_WINDOW_SEC;
-  $("onlineText").textContent = online ? "Online" : "Offline";
-
-  setBadge($("aiBadge"), latest.status || "...");
+  setBadge($("aiBadge"), cur.status || "...");
 }
 
 async function fetchHistory() {
@@ -109,16 +95,11 @@ async function fetchHistory() {
   const js = await res.json();
   if (!js.ok) return;
 
-  const itemsAsc = js.items || [];
-  const latest = itemsAsc.length ? itemsAsc[itemsAsc.length - 1] : null;
-
-  updateTopFromLatest(latest);
+  const itemsAsc = sortByTsAsc(js.items || []);
+  const itemsDesc = [...itemsAsc].reverse();
 
   const tbody = $("historyBody");
   tbody.innerHTML = "";
-
-  // Table: mới nhất lên trên
-  const itemsDesc = [...itemsAsc].reverse();
 
   for (const it of itemsDesc) {
     const tr = document.createElement("tr");
@@ -145,7 +126,6 @@ async function fetchHistory() {
     tbody.appendChild(tr);
   }
 
-  // Chart: timeline tăng dần trái sang phải
   updateChart(itemsAsc);
 }
 
@@ -208,8 +188,6 @@ async function doTrainAI() {
     body: JSON.stringify({ limit: 3000 }),
   });
 
-  if (handle401(res)) return;
-
   const js = await res.json();
   if (!js.ok) {
     alert(js.error || "Huấn luyện thất bại");
@@ -221,14 +199,13 @@ async function doTrainAI() {
 async function doExportExcel() {
   if (!state.token) return;
 
-  // Nhét token vào query để chắc chắn không bị mất header lúc download file
-  const url = `${API_BASE}/api/admin/export_excel?limit=2000&token=${encodeURIComponent(state.token)}`;
-  const res = await fetch(url);
-
-  if (handle401(res)) return;
+  const res = await fetch(`${API_BASE}/api/admin/export_excel?limit=2000`, {
+    headers: authHeaders(),
+  });
 
   if (!res.ok) {
-    alert("Xuất Excel thất bại");
+    const js = await res.json().catch(() => null);
+    alert((js && js.error) ? js.error : "Xuất Excel thất bại");
     return;
   }
 
@@ -250,11 +227,9 @@ async function doDeleteAll() {
     headers: authHeaders(),
   });
 
-  if (handle401(res)) return;
-
-  const js = await res.json();
-  if (!js.ok) {
-    alert(js.error || "Xóa thất bại");
+  const js = await res.json().catch(() => null);
+  if (!js || !js.ok) {
+    alert((js && js.error) ? js.error : "Xóa thất bại");
     return;
   }
 
@@ -275,6 +250,7 @@ function bindEvents() {
 
 async function tick() {
   try {
+    await fetchCurrent();
     await fetchHistory();
   } catch (e) {
     console.log("fetch error", e);
