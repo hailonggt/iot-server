@@ -1,5 +1,8 @@
 flask
 flask-cors
 firebase-admin
-gunicorn
 openpyxl
+numpy
+scikit-learn
+itsdangerous
+gunicorn
