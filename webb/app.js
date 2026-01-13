@@ -37,8 +37,12 @@ function authHeaders() {
   return h;
 }
 
-function sortByTsAsc(items) {
-  return [...items].sort((a, b) => (Number(a.timestamp) || 0) - (Number(b.timestamp) || 0));
+function handleUnauthorized() {
+  state.token = "";
+  localStorage.removeItem("iot_token");
+  refreshAuthUI();
+  showLoginModal(true);
+  alert("Bạn cần đăng nhập lại");
 }
 
 function initChart() {
@@ -52,21 +56,55 @@ function initChart() {
     data: {
       labels: [],
       datasets: [
-        { label: "Khói MQ2", data: [], tension: 0.35, borderWidth: 3 },
-        { label: "Nhiệt độ °C", data: [], tension: 0.35, borderWidth: 3 },
-        { label: "Độ ẩm %", data: [], tension: 0.35, borderWidth: 3 },
+        {
+          label: "Khói MQ2",
+          data: [],
+          tension: 0.35,
+          borderWidth: 3,
+          yAxisID: "ySmoke",
+        },
+        {
+          label: "Nhiệt độ °C",
+          data: [],
+          tension: 0.35,
+          borderWidth: 3,
+          yAxisID: "yOther",
+        },
+        {
+          label: "Độ ẩm %",
+          data: [],
+          tension: 0.35,
+          borderWidth: 3,
+          yAxisID: "yOther",
+        },
       ],
     },
     options: {
       responsive: true,
       maintainAspectRatio: true,
-      animation: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { position: "top" },
+        tooltip: { enabled: true },
+      },
+      scales: {
+        ySmoke: {
+          position: "left",
+          ticks: { precision: 0 },
+        },
+        yOther: {
+          position: "right",
+          grid: { drawOnChartArea: false },
+        },
+      },
     },
   });
 }
 
-function updateChart(itemsAsc) {
+function updateChart(itemsNewestFirst) {
   if (!state.chart) return;
+
+  const itemsAsc = [...itemsNewestFirst].reverse();
 
   state.chart.data.labels = itemsAsc.map((x) => formatTimeFromTs(x.timestamp));
   state.chart.data.datasets[0].data = itemsAsc.map((x) => Number(x.smoke || 0));
@@ -95,13 +133,10 @@ async function fetchHistory() {
   const js = await res.json();
   if (!js.ok) return;
 
-  const itemsAsc = sortByTsAsc(js.items || []);
-  const itemsDesc = [...itemsAsc].reverse();
-
   const tbody = $("historyBody");
   tbody.innerHTML = "";
 
-  for (const it of itemsDesc) {
+  for (const it of js.items) {
     const tr = document.createElement("tr");
 
     const st = it.status || "...";
@@ -126,7 +161,7 @@ async function fetchHistory() {
     tbody.appendChild(tr);
   }
 
-  updateChart(itemsAsc);
+  updateChart(js.items);
 }
 
 function showLoginModal(show) {
@@ -154,9 +189,9 @@ async function doLogin() {
     body: JSON.stringify({ username, password }),
   });
 
-  const js = await res.json();
+  const js = await res.json().catch(() => ({}));
 
-  if (!js.ok) {
+  if (!res.ok || !js.ok) {
     $("loginHint").textContent = js.error || "Đăng nhập thất bại";
     return;
   }
@@ -188,11 +223,17 @@ async function doTrainAI() {
     body: JSON.stringify({ limit: 3000 }),
   });
 
-  const js = await res.json();
-  if (!js.ok) {
+  if (res.status === 401) {
+    handleUnauthorized();
+    return;
+  }
+
+  const js = await res.json().catch(() => ({}));
+  if (!res.ok || !js.ok) {
     alert(js.error || "Huấn luyện thất bại");
     return;
   }
+
   alert("Huấn luyện AI xong");
 }
 
@@ -203,9 +244,14 @@ async function doExportExcel() {
     headers: authHeaders(),
   });
 
+  if (res.status === 401) {
+    handleUnauthorized();
+    return;
+  }
+
   if (!res.ok) {
-    const js = await res.json().catch(() => null);
-    alert((js && js.error) ? js.error : "Xuất Excel thất bại");
+    const txt = await res.text().catch(() => "");
+    alert(txt || "Xuất Excel thất bại");
     return;
   }
 
@@ -227,9 +273,14 @@ async function doDeleteAll() {
     headers: authHeaders(),
   });
 
-  const js = await res.json().catch(() => null);
-  if (!js || !js.ok) {
-    alert((js && js.error) ? js.error : "Xóa thất bại");
+  if (res.status === 401) {
+    handleUnauthorized();
+    return;
+  }
+
+  const js = await res.json().catch(() => ({}));
+  if (!res.ok || !js.ok) {
+    alert(js.error || "Xóa thất bại");
     return;
   }
 
