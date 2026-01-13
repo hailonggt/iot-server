@@ -37,6 +37,21 @@ function authHeaders() {
   return h;
 }
 
+function showLoginModal(show) {
+  $("loginModal").classList.toggle("hidden", !show);
+  $("loginHint").textContent = "";
+}
+
+function refreshAuthUI() {
+  $("btnLoginOpen").classList.toggle("hidden", !!state.token);
+  $("btnLogout").classList.toggle("hidden", !state.token);
+
+  const need = !state.token;
+  $("btnTrainAI").disabled = need;
+  $("btnExportExcel").disabled = need;
+  $("btnDeleteAll").disabled = need;
+}
+
 function handleUnauthorized() {
   state.token = "";
   localStorage.removeItem("iot_token");
@@ -45,9 +60,18 @@ function handleUnauthorized() {
   alert("Bạn cần đăng nhập lại");
 }
 
+function destroyChartIfAny() {
+  if (state.chart) {
+    state.chart.destroy();
+    state.chart = null;
+  }
+}
+
 function initChart() {
   const canvas = $("historyChart");
   if (!canvas) return;
+
+  destroyChartIfAny();
 
   const ctx = canvas.getContext("2d");
 
@@ -61,21 +85,21 @@ function initChart() {
           data: [],
           tension: 0.35,
           borderWidth: 3,
-          yAxisID: "ySmoke",
+          spanGaps: true,
         },
         {
           label: "Nhiệt độ °C",
           data: [],
           tension: 0.35,
           borderWidth: 3,
-          yAxisID: "yOther",
+          spanGaps: true,
         },
         {
           label: "Độ ẩm %",
           data: [],
           tension: 0.35,
           borderWidth: 3,
-          yAxisID: "yOther",
+          spanGaps: true,
         },
       ],
     },
@@ -88,13 +112,12 @@ function initChart() {
         tooltip: { enabled: true },
       },
       scales: {
-        ySmoke: {
+        x: { ticks: { maxRotation: 0, autoSkip: true } },
+        y: {
           position: "left",
+          suggestedMin: 0,
+          suggestedMax: 1000,
           ticks: { precision: 0 },
-        },
-        yOther: {
-          position: "right",
-          grid: { drawOnChartArea: false },
         },
       },
     },
@@ -133,10 +156,12 @@ async function fetchHistory() {
   const js = await res.json();
   if (!js.ok) return;
 
+  const itemsNewestFirst = js.items || [];
+
   const tbody = $("historyBody");
   tbody.innerHTML = "";
 
-  for (const it of js.items) {
+  for (const it of itemsNewestFirst) {
     const tr = document.createElement("tr");
 
     const st = it.status || "...";
@@ -161,22 +186,7 @@ async function fetchHistory() {
     tbody.appendChild(tr);
   }
 
-  updateChart(js.items);
-}
-
-function showLoginModal(show) {
-  $("loginModal").classList.toggle("hidden", !show);
-  $("loginHint").textContent = "";
-}
-
-function refreshAuthUI() {
-  $("btnLoginOpen").classList.toggle("hidden", !!state.token);
-  $("btnLogout").classList.toggle("hidden", !state.token);
-
-  const need = !state.token;
-  $("btnTrainAI").disabled = need;
-  $("btnExportExcel").disabled = need;
-  $("btnDeleteAll").disabled = need;
+  updateChart(itemsNewestFirst);
 }
 
 async function doLogin() {
@@ -215,7 +225,10 @@ async function doLogout() {
 }
 
 async function doTrainAI() {
-  if (!state.token) return;
+  if (!state.token) {
+    showLoginModal(true);
+    return;
+  }
 
   const res = await fetch(`${API_BASE}/api/admin/train_ai`, {
     method: "POST",
@@ -238,7 +251,10 @@ async function doTrainAI() {
 }
 
 async function doExportExcel() {
-  if (!state.token) return;
+  if (!state.token) {
+    showLoginModal(true);
+    return;
+  }
 
   const res = await fetch(`${API_BASE}/api/admin/export_excel?limit=2000`, {
     headers: authHeaders(),
@@ -263,7 +279,10 @@ async function doExportExcel() {
 }
 
 async function doDeleteAll() {
-  if (!state.token) return;
+  if (!state.token) {
+    showLoginModal(true);
+    return;
+  }
 
   const ok = confirm("Bạn chắc chắn muốn xóa toàn bộ lịch sử?");
   if (!ok) return;
