@@ -16,26 +16,17 @@ import numpy as np
 from sklearn.ensemble import IsolationForest
 from openpyxl import Workbook
 
-# ==============================
-# PATHS
-# ==============================
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
 MODEL_PATH = os.path.join(BASE_DIR, "model.pkl")
 
-# ==============================
-# ENV CONFIG
-# ==============================
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "https://baochay-cad24-default-rtdb.asia-southeast1.firebasedatabase.app"
+    "https://baochay-cad24-default-rtdb.asia-southeast1.firebasedatabase.app",
 )
 
-# Render Environment Variable: FIREBASE_SERVICE_ACCOUNT_JSON
 FIREBASE_CRED_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "")
-
-# Optional: lock device post by header X-Device-Key
-DEVICE_KEY = os.getenv("DEVICE_KEY", "")
 
 SECRET_KEY = os.getenv("IOT_SECRET_KEY", "iot_secret_key_change_me")
 ADMIN_USER = os.getenv("IOT_ADMIN_USER", "admin")
@@ -44,37 +35,24 @@ TOKEN_TTL_SECONDS = int(os.getenv("TOKEN_TTL_SECONDS", "3600"))
 
 ONLINE_WINDOW_SEC = 20
 
-# ==============================
-# SMOKE THRESHOLDS
-# Safe: < 400
-# Warn: 400 - 700
-# Danger: > 700
-# ==============================
-SMOKE_SAFE_MAX = 400.0
-SMOKE_WARN_MIN = 400.0
-SMOKE_DANGER_GT = 700.0
-
-TEMP_DANGER_MIN = 55.0
+SMOKE_SAFE_MAX = 400
+SMOKE_DANGER_MIN = 700
+TEMP_DANGER_MIN = 55
 
 STATUS_SAFE = "AN TOÀN"
 STATUS_WARN = "CẢNH BÁO"
 STATUS_DANGER = "NGUY HIỂM"
 
-# ==============================
-# FLASK APP
-# ==============================
-app = Flask(
-    __name__,
-    static_folder=WEB_DIR,
-    static_url_path=""
+
+app = Flask(__name__, static_folder=WEB_DIR, static_url_path="")
+CORS(
+    app,
+    resources={r"/api/*": {"origins": "*"}},
+    allow_headers=["Content-Type", "Authorization", "X-Device-Key"],
 )
-CORS(app)
 
 serializer = URLSafeTimedSerializer(SECRET_KEY)
 
-# ==============================
-# FIREBASE INIT
-# ==============================
 FIREBASE_OK = False
 FIREBASE_ERR = ""
 
@@ -98,7 +76,6 @@ def init_firebase():
         FIREBASE_OK = True
         FIREBASE_ERR = ""
         print("Firebase init OK")
-
     except Exception as e:
         FIREBASE_OK = False
         FIREBASE_ERR = str(e)
@@ -110,11 +87,7 @@ init_firebase()
 
 def firebase_required():
     if not FIREBASE_OK:
-        return jsonify({
-            "ok": False,
-            "error": "Firebase init lỗi",
-            "detail": FIREBASE_ERR
-        }), 500
+        return jsonify({"ok": False, "error": "Firebase init lỗi", "detail": FIREBASE_ERR}), 500
     return None
 
 
@@ -122,21 +95,6 @@ def fb_ref(path: str):
     return db.reference(path)
 
 
-def require_device_key():
-    """
-    Nếu DEVICE_KEY có set trong Render env
-    ESP32 phải gửi header: X-Device-Key: <DEVICE_KEY>
-    Nếu không set thì cho qua
-    """
-    if not DEVICE_KEY:
-        return True
-    got = request.headers.get("X-Device-Key", "")
-    return got == DEVICE_KEY
-
-
-# ==============================
-# AUTH
-# ==============================
 def issue_token(username: str) -> str:
     return serializer.dumps({"u": username})
 
@@ -156,14 +114,13 @@ def get_bearer_token() -> str:
     return ""
 
 
-def require_admin() -> bool:
+def require_admin_or_401():
     token = get_bearer_token()
-    return bool(token) and verify_token(token)
+    if not token or not verify_token(token):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    return None
 
 
-# ==============================
-# AI
-# ==============================
 def load_model():
     if not os.path.exists(MODEL_PATH):
         return None
@@ -182,17 +139,13 @@ def train_ai(rows):
 
     X = []
     for r in rows:
-        try:
-            X.append([
+        X.append(
+            [
                 float(r.get("smoke", 0)),
                 float(r.get("temperature", 0)),
                 float(r.get("humidity", 0)),
-            ])
-        except Exception:
-            continue
-
-    if len(X) < 50:
-        return {"ok": False, "error": "Dữ liệu lỗi quá nhiều, còn dưới 50 bản ghi hợp lệ"}
+            ]
+        )
 
     X = np.array(X)
     mu = X.mean(axis=0)
@@ -201,23 +154,14 @@ def train_ai(rows):
 
     Xn = (X - mu) / std
 
-    model = IsolationForest(
-        n_estimators=300,
-        contamination=0.03,
-        random_state=42
-    )
+    model = IsolationForest(n_estimators=300, contamination=0.03, random_state=42)
     model.fit(Xn)
 
-    save_model({
-        "model": model,
-        "mu": mu,
-        "std": std
-    })
-
+    save_model({"model": model, "mu": mu, "std": std})
     return {"ok": True}
 
 
-def ai_predict(smoke: float, temperature: float, humidity: float):
+def ai_predict(smoke, temperature, humidity):
     payload = load_model()
     if not payload:
         return {"ok": False}
@@ -233,61 +177,37 @@ def ai_predict(smoke: float, temperature: float, humidity: float):
     return {"ok": True, "anomaly": pred == -1}
 
 
-# ==============================
-# HISTORY HELPERS
-# ==============================
-def fetch_history_items(limit: int | None = None):
-    """
-    Không dùng order_by_child("timestamp") để khỏi bị Firebase bắt index rules
-    Lấy theo key (push id) rồi sort timestamp tại server
-    """
-    ref = fb_ref("history")
-
-    if limit is not None:
-        data = ref.order_by_key().limit_to_last(int(limit)).get() or {}
-    else:
-        data = ref.get() or {}
-
-    if not isinstance(data, dict):
-        return []
-
-    items = list(data.values())
-    items.sort(key=lambda x: int(x.get("timestamp", 0) or 0))  # ASC
-    return items
-
-
-# ==============================
-# STATUS LOGIC
-# ==============================
-def compute_status(smoke: float, temperature: float, humidity: float) -> str:
-    if smoke > SMOKE_DANGER_GT or temperature >= TEMP_DANGER_MIN:
+def compute_status(smoke, temperature, humidity):
+    if smoke >= SMOKE_DANGER_MIN or temperature >= TEMP_DANGER_MIN:
         return STATUS_DANGER
 
-    if smoke >= SMOKE_WARN_MIN:
+    if smoke >= SMOKE_SAFE_MAX:
         return STATUS_WARN
 
     ai = ai_predict(smoke, temperature, humidity)
-    if ai.get("ok") and ai.get("anomaly"):
+    if ai.get("anomaly"):
         return STATUS_WARN
 
     return STATUS_SAFE
 
 
-# ==============================
-# ROUTES
-# ==============================
+def _safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _safe_int(v, default=0):
+    try:
+        return int(v)
+    except Exception:
+        return int(default)
+
+
 @app.route("/")
 def index():
     return app.send_static_file("index.html")
-
-
-@app.get("/api/health")
-def api_health():
-    return jsonify({
-        "ok": True,
-        "firebase_ok": FIREBASE_OK,
-        "firebase_err": FIREBASE_ERR
-    })
 
 
 @app.post("/api/sensor")
@@ -296,36 +216,34 @@ def api_sensor():
     if chk:
         return chk
 
-    if not require_device_key():
-        return jsonify({"ok": False, "error": "Device key invalid"}), 401
-
     data = request.get_json(silent=True) or {}
 
-    try:
-        smoke = float(data.get("smoke", 0))
-        temperature = float(data.get("temperature", 0))
-        humidity = float(data.get("humidity", 0))
-    except Exception:
-        return jsonify({"ok": False, "error": "Invalid payload"}), 400
-
+    smoke = _safe_float(data.get("smoke", 0))
+    temperature = _safe_float(data.get("temperature", 0))
+    humidity = _safe_float(data.get("humidity", 0))
     timestamp = int(time.time())
+
     status = compute_status(smoke, temperature, humidity)
 
-    fb_ref("current").set({
-        "smoke": smoke,
-        "temperature": temperature,
-        "humidity": humidity,
-        "timestamp": timestamp,
-        "status": status
-    })
+    fb_ref("current").set(
+        {
+            "smoke": smoke,
+            "temperature": temperature,
+            "humidity": humidity,
+            "timestamp": timestamp,
+            "status": status,
+        }
+    )
 
-    fb_ref("history").push({
-        "smoke": smoke,
-        "temperature": temperature,
-        "humidity": humidity,
-        "timestamp": timestamp,
-        "status": status
-    })
+    fb_ref("history").push(
+        {
+            "smoke": smoke,
+            "temperature": temperature,
+            "humidity": humidity,
+            "timestamp": timestamp,
+            "status": status,
+        }
+    )
 
     return jsonify({"ok": True})
 
@@ -337,20 +255,21 @@ def api_current():
         return chk
 
     cur = fb_ref("current").get() or {}
-
-    ts = int(cur.get("timestamp", 0) or 0)
+    ts = _safe_int(cur.get("timestamp", 0))
     now = int(time.time())
     online = bool(ts) and (now - ts) <= ONLINE_WINDOW_SEC
 
-    return jsonify({
-        "ok": True,
-        "smoke": cur.get("smoke"),
-        "temperature": cur.get("temperature"),
-        "humidity": cur.get("humidity"),
-        "timestamp": ts,
-        "online": online,
-        "status": cur.get("status", STATUS_SAFE)
-    })
+    return jsonify(
+        {
+            "ok": True,
+            "smoke": cur.get("smoke"),
+            "temperature": cur.get("temperature"),
+            "humidity": cur.get("humidity"),
+            "timestamp": ts,
+            "online": online,
+            "status": cur.get("status", STATUS_SAFE),
+        }
+    )
 
 
 @app.get("/api/history")
@@ -359,21 +278,23 @@ def api_history():
     if chk:
         return chk
 
-    limit = int(request.args.get("limit", 20))
-    items = fetch_history_items(limit=limit)
+    limit = _safe_int(request.args.get("limit", 20), 20)
+
+    data = fb_ref("history").order_by_key().limit_to_last(limit).get() or {}
+    items = list(data.values())
+
+    items.sort(key=lambda x: _safe_int(x.get("timestamp", 0)), reverse=True)
+
     return jsonify({"ok": True, "items": items})
 
 
 @app.post("/api/login")
 def api_login():
     data = request.get_json(silent=True) or {}
-    username = (data.get("username") or "").strip()
-    password = (data.get("password") or "").strip()
-
-    if username != ADMIN_USER or password != ADMIN_PASS:
+    if data.get("username") != ADMIN_USER or data.get("password") != ADMIN_PASS:
         return jsonify({"ok": False, "error": "Sai tài khoản hoặc mật khẩu"}), 401
 
-    token = issue_token(username)
+    token = issue_token(data["username"])
     return jsonify({"ok": True, "token": token})
 
 
@@ -382,43 +303,67 @@ def api_logout():
     return jsonify({"ok": True})
 
 
+def _get_history_rows_for_admin(limit_default=3000):
+    limit = limit_default
+    try:
+        body = request.get_json(silent=True) or {}
+        if "limit" in body:
+            limit = _safe_int(body.get("limit", limit_default), limit_default)
+    except Exception:
+        pass
+    if "limit" in request.args:
+        limit = _safe_int(request.args.get("limit", limit_default), limit_default)
+
+    data = fb_ref("history").order_by_key().limit_to_last(limit).get() or {}
+    rows = list(data.values())
+    rows.sort(key=lambda x: _safe_int(x.get("timestamp", 0)))
+    return rows
+
+
 @app.post("/api/admin/train_ai")
 def api_train_ai():
-    if not require_admin():
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    chk = firebase_required()
+    if chk:
+        return chk
 
-    body = request.get_json(silent=True) or {}
-    limit = body.get("limit")
-    limit = int(limit) if limit else None
+    auth = require_admin_or_401()
+    if auth:
+        return auth
 
-    rows = fetch_history_items(limit=limit)
+    rows = _get_history_rows_for_admin(limit_default=3000)
     return jsonify(train_ai(rows))
 
 
 @app.get("/api/admin/export_excel")
 def api_export_excel():
-    if not require_admin():
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    chk = firebase_required()
+    if chk:
+        return chk
 
-    limit = int(request.args.get("limit", 2000))
-    rows = fetch_history_items(limit=limit)
+    auth = require_admin_or_401()
+    if auth:
+        return auth
+
+    rows = _get_history_rows_for_admin(limit_default=2000)
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "history"
+    ws.title = "iot_history"
     ws.append(["timestamp", "time", "smoke", "temperature", "humidity", "status"])
 
     for r in rows:
-        ts = int(r.get("timestamp", 0) or 0)
-        tstr = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else ""
-        ws.append([
-            ts,
-            tstr,
-            r.get("smoke"),
-            r.get("temperature"),
-            r.get("humidity"),
-            r.get("status")
-        ])
+        ts = _safe_int(r.get("timestamp", 0))
+        tm = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else ""
+        ws.append(
+            [
+                ts,
+                tm,
+                r.get("smoke", 0),
+                r.get("temperature", 0),
+                r.get("humidity", 0),
+                r.get("status", ""),
+            ]
+        )
 
     bio = io.BytesIO()
     wb.save(bio)
@@ -428,20 +373,24 @@ def api_export_excel():
         bio,
         as_attachment=True,
         download_name="iot_history.xlsx",
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
 
 @app.post("/api/admin/delete_history")
 def api_delete_history():
-    if not require_admin():
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    chk = firebase_required()
+    if chk:
+        return chk
+
+    auth = require_admin_or_401()
+    if auth:
+        return auth
 
     fb_ref("history").delete()
-    fb_ref("current").delete()
     return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
+    port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
